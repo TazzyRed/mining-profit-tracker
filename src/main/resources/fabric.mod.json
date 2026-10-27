@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "miningprofit",
+  "version": "${version}",
+  "name": "Mining Profit Tracker",
+  "description": "Mining profit overlays for Hypixel SkyBlock: coal, hard stone and gems an hour, pet levelling, shaft loot, Glacite Pickobulus and Mineshafts an hour.",
+  "license": "LGPL-2.1-only",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      {
+        "adapter": "kotlin",
+        "value": "dev.miningprofit.MiningProfit"
+      }
+    ]
+  },
+  "mixins": ["miningprofit.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "~26.1",
+    "java": ">=21",
+    "fabric-api": "*",
+    "fabric-language-kotlin": ">=1.13.0"
+  }
+}
