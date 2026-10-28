@@ -18,7 +18,8 @@ import net.minecraft.world.phys.Vec3
  * Profit tracker: what the blocks you break are worth.
  *
  *  - Every block of a kind it knows ([KINDS]: coal ore, hard stone) that you break - broken by your
- *    client, or gone within [NEAR_YOU] of you (Efficient Miner and the like) - in the mining islands.
+ *    client, or gone near the block you're aiming at or just broke ([reach]: Efficient Miner and the like),
+ *    or in your Pickobulus's blast - in the mining islands.
  *  - Your fortune, read from the tab list every [READ_MS]: Mining Fortune for everything, Ore Fortune on
  *    top for ores, Block Fortune for blocks. A block's expected drops are its base drop times
  *    (1 + fortune / 100) - coal's base is 5 (a block came to ~150 coal at ~2,900 fortune; a 5-minute
@@ -136,8 +137,47 @@ object ProfitTracker {
     // Collections shown an hour, and the only blocks that start the clock off the commission islands
     private val COLLECTED = setOf("ENCHANTED_COAL", "ENCHANTED_OBSIDIAN")
 
-    // Broken this near you by the server (Efficient Miner, Mining Spread): yours
-    private const val NEAR_YOU = 8.0
+    // Broken by the server this near (blocks each way, a cube) to the block you're aiming at or one you broke in the
+    // last [MINED_MS]: yours (Efficient Miner, Mining Spread). Your own spread breaks (12,299 logged in the Mines and
+    // Tunnels): gems 96% within 3, metals 99.7% within 4, ores and stone 99.7% within 4. Further out it's someone else's
+    private fun reach(kind: Kind?): Int = when {
+        kind != null && kind.gem -> 3
+        IslandTracker.currentMiningIsland == "Crystal Hollows" -> 6
+        kind != null && kind.metal -> 4 // glacite too
+        else -> 5 // ores, hard stone, obsidian, fossils
+    }
+    private const val MINED_MS = 1500L
+    // Blocks you broke yourself lately: [pos, when]
+    private val mined = java.util.ArrayDeque<LongArray>()
+
+    // A Pickobulus isn't held to [reach]: for [PICKO_MS] after one's used, what goes within [PICKO_REACH] of where it
+    // lands (its blast reaches 3; one spare for the landing being a block off) or within [PICKO_NEAR_YOU] of you is yours
+    private const val PICKO_MS = 3000L
+    private const val PICKO_REACH = 4
+    private const val PICKO_NEAR_YOU = 8.0
+
+    private fun cube(a: BlockPos, x: Int, y: Int, z: Int) =
+        maxOf(kotlin.math.abs(a.x - x), kotlin.math.abs(a.y - y), kotlin.math.abs(a.z - z))
+
+    /** How far [pos] is (a cube) from the block you're aiming at or the nearest you broke lately; null: neither. */
+    private fun aimDistance(pos: BlockPos, now: Long): Int? {
+        var best: Int? = null
+        val hit = Minecraft.getInstance().hitResult
+        if (hit is net.minecraft.world.phys.BlockHitResult && hit.type == net.minecraft.world.phys.HitResult.Type.BLOCK)
+            best = cube(pos, hit.blockPos.x, hit.blockPos.y, hit.blockPos.z)
+        while (mined.isNotEmpty() && now - mined.peekFirst()[1] > MINED_MS) mined.pollFirst()
+        for (m in mined) {
+            val d = cube(pos, BlockPos.getX(m[0]), BlockPos.getY(m[0]), BlockPos.getZ(m[0]))
+            if (best == null || d < best) best = d
+        }
+        return best
+    }
+
+    private fun byPickobulus(pos: BlockPos, dist: Double, now: Long): Boolean {
+        if (now - dev.miningprofit.commissions.GlacitePickos.usedAt > PICKO_MS) return false
+        val at = dev.miningprofit.commissions.GlacitePickos.landing
+        return (at != null && cube(pos, at.x, at.y, at.z) <= PICKO_REACH) || dist <= PICKO_NEAR_YOU
+    }
     private const val READ_MS = 3_000L
     private const val MANIAC_STEP = 10.0
     private const val MANIAC_BLEGG = 15.0
@@ -429,7 +469,7 @@ object ProfitTracker {
                 val v = valueOf(k, c)
                 "${k.name}: ${c.blocks} blocks (${c.byYou} by you, ${c.blocks - c.byYou} near you), drops ${"%.0f".format(c.drops)}, " +
                     "compact ${c.compact}, worth ${v?.let { "%,.0f".format(it) } ?: "?"}"
-            } + " | gone by distance (<=${NEAR_YOU.toInt()}/<=16/<=32/further): " +
+            } + " | gone by distance from your aim (<=3/4/5/6/further or none): " +
                 gone.entries.joinToString(" ; ") { (k, a) -> "${k.name} ${a.joinToString("/")}" } +
                 " | fortune ${miningNow(now)}/$oreF/$blockF/$gemF/$metalF" + (if (maniac) " +maniac ${"%.1f".format(maniacBonus)} (step ${maniacStep(System.currentTimeMillis())})" else "") +
                 " | ${activeMs / 1000}s")
@@ -737,7 +777,7 @@ object ProfitTracker {
 
     // "Mining Fortune: ☘123", and the like with other symbols or spacing
     private val FORTUNE = Regex("""(Mining|Ore|Block|Gemstone|Dwarven Metal) Fortune\D{0,6}?([\d][\d,.]*)""")
-    // Per kind, blocks gone by distance from you: up to NEAR_YOU, 16, 32, further
+    // Per kind, blocks the server broke (not your Pickobulus) by distance from your aim: up to 3, 4, 5, 6, further or none
     private val gone = HashMap<Kind, IntArray>()
     private var summaryAt = 0L
     private const val SUMMARY_MS = 60_000L
@@ -748,6 +788,10 @@ object ProfitTracker {
     @JvmStatic
     fun onBlockGone(pos: BlockPos, old: BlockState, byYou: Boolean) {
         if (!Config.profitTracker) return
+        if (byYou) {
+            mined.addLast(longArrayOf(pos.asLong(), System.currentTimeMillis()))
+            if (mined.size > 32) mined.pollFirst()
+        }
         val kind = KINDS[old.block]
         // A Fossil (quartz block, slab, stairs) in a Mineshaft gives Fossil Essence
         val fossil = old.block in FOSSILS && IslandTracker.currentMiningIsland == "Mineshaft"
@@ -759,17 +803,12 @@ object ProfitTracker {
         val eye = mc.player?.eyePosition ?: return
         val dist = eye.distanceTo(Vec3.atCenterOf(pos))
         // Every one gone, by how far from you (for the log: what's counted against what isn't)
-        if (!byYou && kind != null) {
-            val b = when {
-                dist <= NEAR_YOU -> 0
-                dist <= 16 -> 1
-                dist <= 32 -> 2
-                else -> 3
-            }
-            gone.getOrPut(kind) { IntArray(4) }[b]++
-        }
-        if (!byYou && dist > NEAR_YOU) return
         val now = System.currentTimeMillis()
+        if (!byYou && !byPickobulus(pos, dist, now)) {
+            val aim = aimDistance(pos, now)
+            if (kind != null) gone.getOrPut(kind) { IntArray(5) }[if (aim == null || aim > 6) 4 else maxOf(0, aim - 3)]++
+            if (aim == null || aim > reach(kind)) return
+        }
         val key = pos.asLong()
         recent[key]?.let { if (now - it < SAME_BREAK_MS) return }
         recent[key] = now

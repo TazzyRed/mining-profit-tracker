@@ -22,10 +22,14 @@ object GlacitePickos {
         clickLook = player.lookAngle
     }
 
+    /** When your last Pickobulus was used, and where it lands (null: it couldn't be worked out) - for the profit tracker. */
+    var usedAt = 0L
+        private set
+    var landing: net.minecraft.core.BlockPos? = null
+        private set
+
     fun onChat(text: String) {
         if (!text.startsWith("You used your Pickobulus")) return
-        val profile = PickoRules.current() ?: return
-        if (profile !== PickoRules.GLACITE) return
         val mc = Minecraft.getInstance()
         val player = mc.player ?: return
         val level = mc.level ?: return
@@ -34,7 +38,12 @@ object GlacitePickos {
         val look = (if (recent) clickLook else null) ?: player.lookAngle
         clickEye = null
         clickLook = null
-        val impact = PickoRules.throwTarget(level, eye, look) ?: return
+        val impact = PickoRules.throwTarget(level, eye, look)
+        usedAt = System.currentTimeMillis()
+        landing = impact
+        if (impact == null) return
+        val profile = PickoRules.current() ?: return
+        if (profile !== PickoRules.GLACITE) return
         val counts = PickoRules.simulate(level, impact, profile)
         val glacite = counts["glacite"]
         if (glacite > 0 && profile.valuable.all { it == "glacite" || counts[it] < glacite }) CommissionsTracker.registerGlacitePicko()
