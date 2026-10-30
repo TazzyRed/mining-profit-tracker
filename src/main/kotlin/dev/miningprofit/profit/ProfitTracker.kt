@@ -1294,7 +1294,7 @@ object ProfitTracker {
     /** [top]: drawn over the open screen (see RatesOverlay.onTop); the HUD's own drawing leaves it to that then. */
     fun render(g: GuiGraphicsExtractor, top: Boolean = false) {
         val mc = Minecraft.getInstance()
-        if (mc.options.hideGui || !Config.profitTracker || mc.debugOverlay.showDebugScreen()) return
+        if (mc.options.hideGui || !Config.profitTracker || mc.debugEntries.isOverlayVisible()) return
         if (!top && dev.miningprofit.gui.RatesOverlay.screenOpen()) return
         // Being moved: that screen draws it
         if (mc.screen is dev.miningprofit.gui.OverlayMover) return

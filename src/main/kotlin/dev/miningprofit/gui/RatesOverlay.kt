@@ -67,7 +67,7 @@ object RatesOverlay {
     /** [top]: drawn over the open screen (see [onTop]); the HUD's own drawing leaves it to that then. */
     fun render(g: GuiGraphicsExtractor, top: Boolean = false) {
         val mc = Minecraft.getInstance()
-        if (mc.options.hideGui || mc.debugOverlay.showDebugScreen()) return
+        if (mc.options.hideGui || mc.debugEntries.isOverlayVisible()) return
         if (!top && screenOpen()) return
         // Being moved: that screen draws it
         if (mc.screen is OverlayMover) return
