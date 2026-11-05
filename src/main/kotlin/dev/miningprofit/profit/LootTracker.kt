@@ -19,7 +19,8 @@ import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
  *  - The rest of a Littlefoot's drops, which the game doesn't put in the chat: Enchanted Glacite (16-32, always:
  *    each charm counts as [GLACITE_PER_LITTLEFOOT], the middle; it's confounded with Compact in the sacks, so it
  *    can't be told apart there), and the chance ones - Glacite Amalgamation and Littlefoot Fluff - that go
- *    straight to the inventory, seen as it goes up in the [WATCH_MS] round a charm ([onClientTick]).
+ *    straight to the inventory, seen as it goes up in the [WATCH_MS] round a charm ([onClientTick]). Corpses
+ *    drop Glacite Amalgamation too: what a corpse's loot lists is its own, not a charm's ([corpseDrop]).
  *
  * An item's priced when the overlay's built, so a price that wasn't in yet when it was looted is used
  * once it is; an item that isn't sold on the bazaar is priced at its lowest BIN ([AuctionPrices]: a Littlefoot
@@ -36,7 +37,8 @@ object LootTracker {
         val keys = HashMap<String, Int>()
 
         fun add(name: String, amount: Long) {
-            items[name] = (items[name] ?: 0L) + amount
+            val n = (items[name] ?: 0L) + amount
+            if (n == 0L) items.remove(name) else items[name] = n
         }
 
         fun clear() {
@@ -79,6 +81,8 @@ object LootTracker {
     private val AUCTION_IDS = mapOf("Littlefoot Fluff" to "LITTLEFOOT_FLUFF")
     // How long either side of a charm an item turning up in the inventory is taken as its drop
     private const val WATCH_MS = 10_000L
+    // After a world change the server refills the inventory: what turns up in this long isn't a drop
+    private const val SETTLE_MS = 5_000L
     // The inventory is looked at every this many ticks
     private const val LOOK_EVERY = 5
     private val COLOR = Regex("§.")
@@ -107,12 +111,23 @@ object LootTracker {
     // What each item was last priced at (to log when it changes)
     private val priced = HashMap<String, Double>()
 
+    // Some of an item that turned up in the inventory
+    private class Rise(val time: Long, val name: String, var amount: Long)
+
     // The inventory's count of each of INVENTORY_DROPS as last looked at (null: not looked at yet), what turned up
-    // in the last WATCH_MS (not claimed by a charm yet), and till when the next to turn up is a charm's
+    // in the last WATCH_MS (not claimed by a charm yet), what a charm claimed in the last WATCH_MS (a corpse's loot
+    // can still say it was its), and till when the next to turn up is a charm's
     private var held: Map<String, Long>? = null
-    private val arrived = ArrayList<Triple<Long, String, Long>>()
+    private val arrived = ArrayList<Rise>()
+    private val claimed = ArrayList<Rise>()
     private var claimUntil = 0L
+    // What a corpse's loot listed that's not in the inventory yet: the next of it to turn up is the corpse's
+    private val owed = HashMap<String, Long>()
+    private var owedUntil = 0L
     private var ticks = 0
+    // The world last looked at, and till when the inventory's only noted (it's being refilled)
+    private var levelSeen: Any? = null
+    private var settleUntil = 0L
 
     fun any(): Boolean = bag.any()
 
@@ -121,7 +136,9 @@ object LootTracker {
         mode = Mode.NONE
         block.clear()
         arrived.clear()
+        claimed.clear()
         claimUntil = 0L
+        owed.clear()
         held = null
     }
 
@@ -168,6 +185,7 @@ object LootTracker {
             // Powder isn't an item
             if (name == "Glacite Powder") continue
             corpses.add(name, n)
+            if (name in INVENTORY_DROPS) corpseDrop(name, n)
         }
         corpses.count++
         val key = KEYS[corpseType]
@@ -178,16 +196,48 @@ object LootTracker {
         block.clear()
     }
 
+    // [n] of [name] in a corpse's loot: it's the corpse's, so it's taken from what turned up in the inventory round it
+    // (and from a charm that claimed it), and what hasn't turned up yet isn't a charm's when it does
+    private fun corpseDrop(name: String, n: Long) {
+        val now = System.currentTimeMillis()
+        var left = n - take(arrived, name, n, now)
+        val back = take(claimed, name, left, now)
+        if (back > 0) {
+            littlefoot.add(name, -back)
+            log.info("[MP loot] Littlefoot: $name x$back was a corpse's, not the charm's")
+        }
+        left -= back
+        if (left > 0) {
+            owed[name] = (owed[name] ?: 0L) + left
+            owedUntil = now + WATCH_MS
+        }
+    }
+
+    // Takes up to [wanted] of [name] from [rises] in the last WATCH_MS, returns how many it took
+    private fun take(rises: MutableList<Rise>, name: String, wanted: Long, now: Long): Long {
+        var left = wanted
+        for (r in rises) {
+            if (left == 0L) break
+            if (r.name != name || now - r.time > WATCH_MS) continue
+            val t = minOf(left, r.amount)
+            r.amount -= t
+            left -= t
+        }
+        rises.removeAll { it.amount == 0L }
+        return wanted - left
+    }
+
     // A Littlefoot was charmed: its Enchanted Glacite, and the chance drops that turned up just before or will just after
     private fun littlefootKilled() {
         val now = System.currentTimeMillis()
         littlefoot.add("Enchanted Glacite", GLACITE_PER_LITTLEFOOT)
         littlefoot.count++
-        arrived.removeAll { now - it.first > WATCH_MS }
-        for ((_, name, n) in arrived) {
-            littlefoot.add(name, n)
-            log.info("[MP loot] Littlefoot: $name x$n (in the inventory just before the charm)")
+        arrived.removeAll { now - it.time > WATCH_MS }
+        for (r in arrived) {
+            littlefoot.add(r.name, r.amount)
+            log.info("[MP loot] Littlefoot: ${r.name} x${r.amount} (in the inventory just before the charm)")
         }
+        claimed.addAll(arrived)
         arrived.clear()
         claimUntil = now + WATCH_MS
         log.info("[MP loot] Littlefoot charmed (${shardPrice()})")
@@ -202,14 +252,22 @@ object LootTracker {
     /**
      * Every tick: watches the inventory for the chance drops of a Littlefoot ([INVENTORY_DROPS]). A rise in the count
      * in the [WATCH_MS] after a charm is the charm's; one just before it is kept to be claimed by it. With a
-     * screen open the count's only noted (things moved about aren't drops).
+     * screen open, or for [SETTLE_MS] after a world change (the server refilling it), the count's only noted.
      */
     fun onClientTick() {
         val mc = Minecraft.getInstance()
         val player = mc.player ?: run { held = null; return }
         if (++ticks % LOOK_EVERY != 0) return
         val now = System.currentTimeMillis()
-        arrived.removeAll { now - it.first > WATCH_MS }
+        if (mc.level !== levelSeen) {
+            levelSeen = mc.level
+            held = null
+            arrived.clear()
+            settleUntil = now + SETTLE_MS
+        }
+        arrived.removeAll { now - it.time > WATCH_MS }
+        claimed.removeAll { now - it.time > WATCH_MS }
+        if (now > owedUntil) owed.clear()
         val counts = HashMap<String, Long>()
         val inv = player.inventory
         for (i in 0 until inv.containerSize) {
@@ -220,15 +278,23 @@ object LootTracker {
         }
         val before = held
         held = counts
-        if (before == null || mc.screen is AbstractContainerScreen<*>) return
+        if (before == null || mc.screen is AbstractContainerScreen<*> || now < settleUntil) return
         for (name in INVENTORY_DROPS) {
-            val d = (counts[name] ?: 0L) - (before[name] ?: 0L)
+            var d = (counts[name] ?: 0L) - (before[name] ?: 0L)
             if (d <= 0) continue
+            // A corpse's, listed in its loot already
+            val o = minOf(d, owed[name] ?: 0L)
+            if (o > 0) {
+                owed[name] = owed.getValue(name) - o
+                d -= o
+                if (d == 0L) continue
+            }
             if (now < claimUntil) {
                 littlefoot.add(name, d)
+                claimed.add(Rise(now, name, d))
                 log.info("[MP loot] Littlefoot: $name x$d (in the inventory just after the charm)")
             } else {
-                arrived.add(Triple(now, name, d))
+                arrived.add(Rise(now, name, d))
             }
         }
     }
