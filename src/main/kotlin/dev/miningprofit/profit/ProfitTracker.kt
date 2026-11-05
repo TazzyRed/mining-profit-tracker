@@ -1054,13 +1054,12 @@ object ProfitTracker {
     private val GEM_NAMES = arrayOf("FLAWED", "FINE", "FLAWLESS")
     private val GEM_BELOW = arrayOf("ROUGH", "FLAWED", "FINE")
 
-    // What one gem of the chosen tier ([Config.profitGemTier]) sells for: that tier's, or 80 of the one below if that's
-    // worth more
+    // What one gem of the chosen tier ([Config.profitGemTier]) sells for: that tier's own price, or 80 of the one below
+    // when it has none. (Not the higher of the two: a lower tier's sell offer can be a listing nobody fills - Rough
+    // Jasper's sat at 79.5, ten times a Flawed's worth per rough, with Flawed at 817)
     private fun gemUnit(gem: String): Double? {
         val tier = Config.profitGemTier.coerceIn(0, 2)
-        val top = sell("${GEM_NAMES[tier]}_${gem}_GEM")
-        val below = sell("${GEM_BELOW[tier]}_${gem}_GEM")?.times(80.0)
-        return listOfNotNull(top, below).maxOrNull()
+        return sell("${GEM_NAMES[tier]}_${gem}_GEM") ?: sell("${GEM_BELOW[tier]}_${gem}_GEM")?.times(80.0)
     }
 
     /**
