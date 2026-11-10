@@ -737,6 +737,21 @@ object ProfitTracker {
     private val COMPACT = Regex("""^COMPACT! You found an? (.+?)!""")
 
     /** A chat message (colour codes stripped): Compact's drops. */
+    /**
+     * A chat message as it came: a "[Sacks] +N items." one's hover has the Mining Fiesta drops (see LootTracker), counted
+     * while you're mining where an overlay is (a sack filled from your inventory or stash isn't a drop).
+     */
+    fun onSacks(message: net.minecraft.network.chat.Component, plain: String) {
+        if (!Config.profitTracker || !plain.startsWith("[Sacks] +")) return
+        val s = sessionHere() ?: return
+        if (System.currentTimeMillis() - s.lastBreak > SACKS_MINING_MS) return
+        use(s)
+        LootTracker.bag = s.loot
+        LootTracker.onSacks(message)
+    }
+    // A "[Sacks]" line covers up to 30 seconds: mining this recently, what it lists came from the mining
+    private const val SACKS_MINING_MS = 90_000L
+
     fun onChat(text: String) {
         if (!Config.profitTracker) return
         use(sessionHere())
@@ -1215,8 +1230,9 @@ object ProfitTracker {
         val fossil = LootTracker.value(l.fossils)
         val shard = LootTracker.value(l.shards)
         val foot = LootTracker.value(l.littlefoot)
-        if (corpse.loading || fossil.loading || shard.loading || foot.loading) priced = false
-        val allDrops = drops + corpse.coins + fossil.coins + shard.coins + foot.coins
+        val fiesta = LootTracker.value(l.fiesta)
+        if (corpse.loading || fossil.loading || shard.loading || foot.loading || fiesta.loading) priced = false
+        val allDrops = drops + corpse.coins + fossil.coins + shard.coins + foot.coins + fiesta.coins
         val pets = petCoins(s)
         val total = allDrops + pets
         // (every per hour over the session's own clock, the commission timer's no part of it)
@@ -1253,6 +1269,10 @@ object ProfitTracker {
         if (!l.littlefoot.isEmpty) {
             dropRows.add("§3Littlefoot (${l.littlefoot.count}, besides the shards): §a${short(foot.coins)}")
             LootTracker.itemLines(l.littlefoot).forEach { dropRows.add("  $it") }
+        }
+        if (!l.fiesta.isEmpty) {
+            dropRows.add("§5Mining Fiesta (${l.fiesta.items.values.sum()}): §a${short(fiesta.coins)}")
+            LootTracker.itemLines(l.fiesta).forEach { dropRows.add("  $it") }
         }
         by["drops"] = Row("drops", "§6✦ §7Drops Profit: §a${short(allDrops)}" + perHr(allDrops), dropRows)
 

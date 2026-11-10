@@ -71,6 +71,7 @@ object MiningProfit : ClientModInitializer {
             CommissionClock.onChat(plain)
             GlacitePickos.onChat(plain)
             ProfitTracker.onChat(plain)
+            ProfitTracker.onSacks(message, plain)
             ExpShare.onChat(message, plain)
         })
 

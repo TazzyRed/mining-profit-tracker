@@ -24,7 +24,11 @@ import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
  *
  * An item's priced when the overlay's built, so a price that wasn't in yet when it was looted is used
  * once it is; an item that isn't sold on the bazaar is priced at its lowest BIN ([AuctionPrices]: a Littlefoot
- * Fluff), and one that's on neither (a fossil, an enchanted book) counts as nothing.
+ * Fluff, a corpse's Shattered Locket - by its id from Hypixel's items list), and one that's on neither counts as
+ * nothing. An enchanted book is priced as its bazaar enchantment ("Enchanted Book (Ice Cold I)": ENCHANTMENT_ICE_COLD_1).
+ *
+ * Mining Fiesta's Glossy Gemstones and Refined Minerals go straight into the sacks with no chat line of their own:
+ * they're read off the "[Sacks] +N items." line's hover ([onSacks]), but not what was bought at the bazaar.
  */
 object LootTracker {
 
@@ -59,7 +63,8 @@ object LootTracker {
         val fossils = Bucket()
         val shards = Bucket()
         val littlefoot = Bucket()
-        val all get() = listOf(corpses, fossils, shards, littlefoot)
+        val fiesta = Bucket()
+        val all get() = listOf(corpses, fossils, shards, littlefoot, fiesta)
         fun any(): Boolean = all.any { !it.isEmpty }
         fun clear() = all.forEach { it.clear() }
     }
@@ -70,6 +75,7 @@ object LootTracker {
     val fossils get() = bag.fossils
     val shards get() = bag.shards
     val littlefoot get() = bag.littlefoot
+    val fiesta get() = bag.fiesta
 
     private enum class Mode { NONE, CORPSE }
 
@@ -79,6 +85,16 @@ object LootTracker {
     private val INVENTORY_DROPS = setOf("Glacite Amalgamation", "Littlefoot Fluff")
     // Items that aren't on the bazaar but have a lowest BIN, by name (the id Coflnet knows them by)
     private val AUCTION_IDS = mapOf("Littlefoot Fluff" to "LITTLEFOOT_FLUFF")
+    // "Enchanted Book (Ice Cold I)"
+    private val BOOK = Regex("""^Enchanted Book \((.+) ([IVX]+)\)$""")
+    private val ROMAN = mapOf('I' to 1, 'V' to 5, 'X' to 10)
+
+    // The Mining Fiesta drops (into the sacks), and a "[Sacks]" hover line: "+3 Glossy Gemstone (Gemstone Sack)"
+    private val FIESTA_DROPS = setOf("Glossy Gemstone", "Refined Mineral")
+    private val SACK_LINE = Regex("""^\s*\+([\d,]+) (.+?) \(""")
+    // Bought at the bazaar: into the sacks too, and not a drop. A "[Bazaar]" line naming one in this long before
+    private const val BOUGHT_MS = 60_000L
+    private val bazaarAt = HashMap<String, Long>()
     // How long either side of a charm an item turning up in the inventory is taken as its drop
     private const val WATCH_MS = 10_000L
     // After a world change the server refills the inventory: what turns up in this long isn't a drop
@@ -144,6 +160,10 @@ object LootTracker {
 
     /** A chat message (colour codes stripped, not trimmed). */
     fun onChat(text: String) {
+        if (text.startsWith("[Bazaar]")) {
+            for (name in FIESTA_DROPS) if (name in text) bazaarAt[name] = System.currentTimeMillis()
+            return
+        }
         CHARM.find(text)?.let { m ->
             val n = m.groupValues[1].toLongOrNull() ?: return
             shards.add(m.groupValues[2] + " Shard", n)
@@ -299,6 +319,28 @@ object LootTracker {
         }
     }
 
+    /** A "[Sacks] +N items." message: the Mining Fiesta drops its hover lists. */
+    fun onSacks(message: net.minecraft.network.chat.Component) {
+        val now = System.currentTimeMillis()
+        // (the same hover is on several parts of the message: each once)
+        val hovers = message.toFlatList().mapNotNull { (it.style.hoverEvent as? net.minecraft.network.chat.HoverEvent.ShowText)?.value()?.string }.distinct()
+        for (hover in hovers) {
+            for (line in hover.replace(COLOR, "").lines()) {
+                val m = SACK_LINE.find(line) ?: continue
+                val name = m.groupValues[2].trim()
+                if (name !in FIESTA_DROPS) continue
+                val n = m.groupValues[1].replace(",", "").toLongOrNull() ?: continue
+                if (now - (bazaarAt[name] ?: 0L) < BOUGHT_MS) {
+                    log.info("[MP loot] $name x$n into the sacks: bought, not a drop")
+                    continue
+                }
+                fiesta.add(name, n)
+                fiesta.count++
+                log.info("[MP loot] Fiesta: $name x$n")
+            }
+        }
+    }
+
     /** A Fossil block in a Mineshaft was broken: its Fossil Essence. */
     fun fossilBlock() {
         fossils.add("Fossil Essence", ESSENCE_PER_FOSSIL)
@@ -312,18 +354,36 @@ object LootTracker {
     // (Shards and essences have bazaar ids by their name alone, so they wait only for the prices, not for the names)
     private fun unit(name: String): Worth {
         val auction = AUCTION_IDS[name]
-        if (auction != null) {
-            AuctionPrices.lowestBin(auction)?.let { return Worth(it, false) }
-            return Worth(null, AuctionPrices.loading(auction))
+        if (auction != null) return lowestBin(auction)
+        BOOK.find(name)?.let { m ->
+            val id = "ENCHANTMENT_" + m.groupValues[1].uppercase().replace(' ', '_') + "_" + roman(m.groupValues[2])
+            if (Bazaar.updatedAt <= 0) return Worth(null, true)
+            return Worth(ProfitTracker.sell(id), false)
         }
         val id = Bazaar.idOfName(name)
         if (id != null) {
             if (Bazaar.updatedAt <= 0) return Worth(null, true)
-            // (an id made from the name that has no bazaar product is not on the bazaar: no price, nothing to wait for)
+            // (not on the bazaar - a Shattered Locket, an Onyx Crystal: its lowest BIN)
+            if (!Bazaar.onBazaar(id)) return lowestBin(id)
             return Worth(ProfitTracker.sell(id), false)
         }
         // No id: not on the bazaar - or the names aren't in yet
         return Worth(null, !Bazaar.namesLoaded)
+    }
+
+    private fun lowestBin(id: String): Worth {
+        AuctionPrices.lowestBin(id)?.let { return Worth(it, false) }
+        return Worth(null, AuctionPrices.loading(id))
+    }
+
+    private fun roman(s: String): Int {
+        var total = 0
+        for (i in s.indices) {
+            val v = ROMAN[s[i]] ?: 0
+            val next = if (i + 1 < s.length) ROMAN[s[i + 1]] ?: 0 else 0
+            total += if (v < next) -v else v
+        }
+        return total
     }
 
     /** [b]'s items and keys, the most valuable first, one line each (for the overlay's hover). */
