@@ -553,9 +553,12 @@ object ProfitTracker {
     // ("/3.5M") - or with a percentage, or nothing after it
     private val XP_FULL = Regex("""\+([\d,.]+) Mining \(([\d,.]+)/([\d,.]+)([kKmMbB]?)\)""")
     private val XP_GAIN = Regex("""\+([\d,.]+) Mining(?: \([^)]*\))?""")
+    // Maxed (or shown as your total): "+12.5 Mining (123,456,789)" - a running total, that never goes back
+    private val XP_TOTAL = Regex("""\+([\d,.]+) Mining \(([\d,]+(?:\.\d+)?)\)""")
+    private var totalNow = -1.0
     // "+73.9 Mining (17.65%)": the percentage of the way to your next Mining level - each gain reads the
     // same until that moves on, so the XP is taken from how far it's moved, of what the level takes
-    private val XP_PCT = Regex("""\+[\d,.]+ Mining \(([\d.]+)%\)""")
+    private val XP_PCT = Regex("""\+([\d,.]+) Mining \(([\d.]+)%\)""")
     // Skill XP from each level to the next (0 to 1 first)
     private val SKILL_XP = longArrayOf(50, 125, 200, 300, 500, 750, 1000, 1500, 2000, 3500, 5000, 7500, 10000, 15000, 20000, 30000,
         50000, 75000, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1100000, 1200000, 1300000,
@@ -583,27 +586,44 @@ object ProfitTracker {
             val need = (full.groupValues[3].replace(",", "").toDoubleOrNull() ?: return) *
                 when (full.groupValues[4].lowercase()) { "k" -> 1e3; "m" -> 1e6; "b" -> 1e9; else -> 1.0 }
             if (xpNow >= 0) {
-                val d = if (cur >= xpNow) cur - xpNow else (xpNeed - xpNow).coerceAtLeast(0.0) + cur
-                if (d > 0) gainedXp(d, now)
+                // Gone round (a level up) only from near the end to near the start; a smaller step back is an old
+                // bar shown again, and counts nothing (nor moves where it's counted from)
+                val wrapped = xpNeed > 0 && need > 0 && cur < xpNow && xpNow - cur > xpNeed / 2
+                if (cur < xpNow && !wrapped) { xpOdd("total back from ${xpNow} to $cur of $need"); return }
+                val d = if (wrapped) (xpNeed - xpNow).coerceAtLeast(0.0) + cur else cur - xpNow
+                if (wrapped) xpOdd("level up: ${xpNow}/${xpNeed} to $cur/$need, +${"%.0f".format(d)}")
+                if (d > 0) gainedXp(capped(d, full.groupValues[1], 1.0), now)
             }
             xpNow = cur
             xpNeed = need
             return
         }
+        val total = XP_TOTAL.find(text)
+        if (total != null) {
+            val cur = total.groupValues[2].replace(",", "").toDoubleOrNull() ?: return
+            // (a step back's an old bar: nothing, and it's still counted from the higher)
+            if (totalNow >= 0 && cur < totalNow) { xpOdd("total back from $totalNow to $cur"); return }
+            if (totalNow >= 0 && cur > totalNow) gainedXp(capped(cur - totalNow, total.groupValues[1], 1.0), now)
+            totalNow = cur
+            return
+        }
         val level = ExpShare.miningLevel
-        val pct = XP_PCT.find(text)?.groupValues?.get(1)?.toDoubleOrNull()
+        val pctBar = XP_PCT.find(text)
+        val pct = pctBar?.groupValues?.get(2)?.toDoubleOrNull()
         if (pct != null && level in 0 until SKILL_XP.size) {
             if (pctNow >= 0 && pctLevel in 0 until SKILL_XP.size) {
-                val d = when {
-                    pct >= pctNow && level == pctLevel -> (pct - pctNow) / 100.0 * SKILL_XP[level]
-                    // A level gained: the rest of the old one and this much of the new (the level-up's message
-                    // may be yet to come)
-                    else -> {
-                        val next = if (level == pctLevel) minOf(level + 1, SKILL_XP.size - 1) else level
-                        (100.0 - pctNow) / 100.0 * SKILL_XP[pctLevel] + pct / 100.0 * SKILL_XP[next]
-                    }
-                }
-                if (d > 0) gainedXp(d, now)
+                // A level gained only when the bar's gone round, from near the end to near the start (the level-up's
+                // message may be yet to come); a smaller step back is an old bar shown again, and counts nothing (nor
+                // moves where it's counted from) - each one used to count as a whole level
+                val wrapped = pct < pctNow && pctNow - pct >= 50.0
+                if (pct < pctNow && !wrapped) { xpOdd("% back from $pctNow to $pct (level $level)"); return }
+                val d = if (wrapped) {
+                    val next = if (level == pctLevel) minOf(level + 1, SKILL_XP.size - 1) else level
+                    (100.0 - pctNow) / 100.0 * SKILL_XP[pctLevel] + pct / 100.0 * SKILL_XP[next]
+                } else (pct - pctNow) / 100.0 * SKILL_XP[level]
+                if (wrapped || level != pctLevel) xpOdd("level ${pctLevel} $pctNow% to $level $pct%, +${"%.0f".format(d)}")
+                // (the bar's to 0.01%: a move of one step can be more than its gain)
+                if (d > 0) gainedXp(capped(d, pctBar.groupValues[1], SKILL_XP[level] * 3 / 10_000.0), now)
             }
             pctNow = pct
             pctLevel = level
@@ -622,6 +642,23 @@ object ProfitTracker {
         gainedXp(gain.groupValues[1].replace(",", "").toDoubleOrNull() ?: 0.0, now)
     }
     private var xpNeed = 0.0
+
+    // What the bar moved by, but no more than three times the gain it says ("+27,750 Mining", all of a burst so far) and a
+    // few steps of its rounding: a move past that isn't XP (a bar that reads some other way - your total, not the level's
+    // - or a level misread), and only the gain's counted
+    private fun capped(d: Double, gain: String, step: Double): Double {
+        val shown = gain.replace(",", "").toDoubleOrNull() ?: return 0.0
+        val most = shown * 3 + step
+        if (d <= most) return d
+        xpOdd("moved ${"%.0f".format(d)} on a +$gain bar: counted ${"%.0f".format(shown)}")
+        return shown
+    }
+
+    // What the Mining XP bar does out of the way (a step back, a level up), in the log: the first few a session
+    private var xpOddLogged = 0
+    private fun xpOdd(what: String) {
+        if (xpOddLogged++ < 20) org.slf4j.LoggerFactory.getLogger("MiningProfit").info("[MP profit] Mining XP bar: $what")
+    }
 
     // Mining XP gained: anywhere, it levels the pets you're sharing XP with; on commissions it's shown too
     private fun gainedXp(d: Double, now: Long) {
